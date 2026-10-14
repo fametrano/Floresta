@@ -1006,12 +1006,13 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
         // Regtest don't have retarget
         if !params.params.no_pow_retargeting {
-            // First block in this epoch
-            let first_block = self.get_header_by_height(next_height - 2016)?;
-            let last_block = self.get_header_by_height(next_height - 1)?;
+            // Core reads both ends of the epoch from the new header's own ancestors
+            // (`pindexLast->GetAncestor`), and the parent may be on a fork.
+            let first_block =
+                self.get_ancestor_at_height(last_block, next_height - 1, next_height - 2016)?;
 
             let target =
-                Consensus::calc_next_work_required(&last_block, &first_block, self.chain_params());
+                Consensus::calc_next_work_required(last_block, &first_block, self.chain_params());
 
             if target < params.params.max_attainable_target {
                 return Ok(target);
@@ -1021,6 +1022,28 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         }
 
         Ok(last_block.target())
+    }
+
+    /// Returns the ancestor of `header` at `target_height`, where `header` is at `header_height`.
+    ///
+    /// The height index only knows the best chain, so it is used when `header` is on it. Otherwise
+    /// this follows `prev_blockhash`, which is also right for a header on a fork.
+    fn get_ancestor_at_height(
+        &self,
+        header: &BlockHeader,
+        header_height: u32,
+        target_height: u32,
+    ) -> Result<BlockHeader, BlockchainError> {
+        if self.get_block_hash(header_height).ok() == Some(header.block_hash()) {
+            return Ok(*self.get_header_by_height(target_height)?);
+        }
+
+        let mut ancestor = *header;
+        for _ in target_height..header_height {
+            ancestor = *self.get_disk_block_header(&ancestor.prev_blockhash)?;
+        }
+
+        Ok(ancestor)
     }
 
     /// Check timestamp against prev for difficulty-adjustment blocks to prevent timewarp attacks.
@@ -1034,7 +1057,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             return Ok(());
         }
 
-        let prev_header = self.get_header_by_height(height - 1)?;
+        let prev_header = self.get_disk_block_header(&block.prev_blockhash)?;
         Ok(Consensus::check_bip94_time(block, &prev_header)?)
     }
 
@@ -2127,6 +2150,99 @@ mod test {
         assert_eq!(
             required_bits(&chain, &last, 4, last.time + 10 * 60),
             TESTNET_POW_LIMIT_BITS
+        );
+    }
+
+    /// A chain of `network` with `2015` headers at the pow limit, and a header at height 2015
+    /// that is a sibling of the best tip, stored as a fork and mined an hour earlier.
+    fn chain_with_fork_at_height_2015(
+        network: Network,
+    ) -> (ChainState<FlatChainStore>, Vec<BlockHeader>, BlockHeader) {
+        let chain = setup_test_chain(network, AssumeValidArg::Disabled, None);
+        let headers = store_headers_with_bits(&chain, network, &[TESTNET_POW_LIMIT_BITS; 2015]);
+
+        let fork = BlockHeader {
+            time: headers[2015].time - 3600,
+            nonce: 1,
+            ..headers[2015]
+        };
+        write_lock!(chain)
+            .chainstore
+            .save_header(&DiskBlockHeader::InFork(fork, 2015))
+            .unwrap();
+
+        (chain, headers, fork)
+    }
+
+    #[test]
+    fn retarget_is_computed_from_the_parents_own_ancestors() {
+        let (chain, headers, fork) = chain_with_fork_at_height_2015(Network::Testnet);
+        let child = BlockHeader {
+            prev_blockhash: fork.block_hash(),
+            time: fork.time + 600,
+            ..fork
+        };
+
+        // Core: `pindexLast->GetAncestor`, so the epoch ends at the fork, not at the best tip
+        let on_fork = Consensus::calc_next_work_required(&fork, &headers[0], chain.chain_params());
+        let on_best =
+            Consensus::calc_next_work_required(&headers[2015], &headers[0], chain.chain_params());
+        assert_ne!(on_fork, on_best);
+
+        assert_eq!(
+            chain
+                .get_next_required_work(&fork, 2016, &child)
+                .unwrap()
+                .to_compact_lossy(),
+            on_fork.to_compact_lossy()
+        );
+    }
+
+    #[test]
+    fn bip94_time_is_checked_against_the_parent_on_a_fork() {
+        let (chain, _, fork) = chain_with_fork_at_height_2015(Network::Testnet4);
+        let child = BlockHeader {
+            prev_blockhash: fork.block_hash(),
+            time: fork.time + 10,
+            ..fork
+        };
+
+        // The best tip is an hour later than the fork, which would make this child too early
+        assert!(chain.check_bip94_block(&child, 2016).is_ok());
+    }
+
+    #[test]
+    fn ancestor_at_height_follows_a_fork() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let headers = store_headers_with_bits(&chain, Network::Regtest, &[0x207f_ffff; 5]);
+
+        // A fork from height 2, with different headers at heights 3, 4 and 5
+        let mut forks = vec![headers[2]];
+        for height in 3..=5_u32 {
+            let parent = forks.last().unwrap();
+            let fork = BlockHeader {
+                prev_blockhash: parent.block_hash(),
+                nonce: 100 + height,
+                ..headers[height as usize]
+            };
+            write_lock!(chain)
+                .chainstore
+                .save_header(&DiskBlockHeader::InFork(fork, height))
+                .unwrap();
+            forks.push(fork);
+        }
+        let (fork3, fork5) = (forks[1], forks[3]);
+        assert_ne!(fork3, headers[3]);
+
+        assert_eq!(chain.get_ancestor_at_height(&fork5, 5, 3).unwrap(), fork3);
+        assert_eq!(
+            chain.get_ancestor_at_height(&fork5, 5, 2).unwrap(),
+            headers[2]
+        );
+        // On the best chain it reads the height index
+        assert_eq!(
+            chain.get_ancestor_at_height(&headers[5], 5, 3).unwrap(),
+            headers[3]
         );
     }
 
