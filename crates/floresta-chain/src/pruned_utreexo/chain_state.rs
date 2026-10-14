@@ -222,25 +222,27 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
     }
 
     fn validate_header(&self, block_header: &BlockHeader) -> Result<BlockHash, BlockchainError> {
+        // As in Core, the header's own proof of work comes first: it is the cheap check, and the
+        // ones below read the chain.
+        let block_hash = block_header
+            .validate_pow(block_header.target())
+            .map_err(|_| BlockValidationErrors::NotEnoughPow)?;
+
         let prev_block = self.get_disk_block_header(&block_header.prev_blockhash)?;
         let height = prev_block
             .height()
             .ok_or(BlockValidationErrors::BlockExtendsAnOrphanChain)?
             + 1;
 
-        // Check pow
+        // Like Core's `bad-diffbits`, the compact bits must match exactly: a harder target
+        // than the required one is invalid too.
         let expected_target = self.get_next_required_work(&prev_block, height, block_header)?;
-
-        let actual_target = block_header.target();
-        if actual_target > expected_target {
-            Err(BlockValidationErrors::NotEnoughPow)?;
+        if block_header.bits != expected_target.to_compact_lossy() {
+            Err(BlockValidationErrors::BadDiffBits)?;
         }
 
         self.check_bip94_block(block_header, height)?;
 
-        let block_hash = block_header
-            .validate_pow(actual_target)
-            .map_err(|_| BlockValidationErrors::NotEnoughPow)?;
         Ok(block_hash)
     }
 
@@ -2209,6 +2211,80 @@ mod test {
 
         // The best tip is an hour later than the fork, which would make this child too early
         assert!(chain.check_bip94_block(&child, 2016).is_ok());
+    }
+
+    /// A regtest child of genesis with the given bits and a valid proof of work.
+    fn mined_regtest_child(bits: u32) -> BlockHeader {
+        let genesis = genesis_block(Network::Regtest).header;
+        let mut header = BlockHeader {
+            version: HeaderVersion::TWO,
+            prev_blockhash: genesis.block_hash(),
+            merkle_root: genesis.merkle_root,
+            time: genesis.time + 600,
+            bits: CompactTarget::from_consensus(bits),
+            nonce: 0,
+        };
+        while header.validate_pow(header.target()).is_err() {
+            header.nonce += 1;
+        }
+        header
+    }
+
+    #[test]
+    fn accept_header_rejects_harder_bits_than_required() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let genesis = genesis_block(Network::Regtest);
+
+        // Regtest requires 0x207fffff. This target is 128 times smaller (about 256 hashes to
+        // mine, against 2) and the proof of work is valid for it, but Core rejects it with
+        // `bad-diffbits`.
+        let header = mined_regtest_child(0x2000_ffff);
+
+        assert!(matches!(
+            chain.accept_header(header),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadDiffBits
+            ))
+        ));
+        assert_eq!(chain.get_best_block().unwrap(), (0, genesis.block_hash()));
+        assert!(chain.get_disk_block_header(&header.block_hash()).is_err());
+    }
+
+    #[test]
+    fn accept_header_accepts_exactly_the_required_bits() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+
+        let header = mined_regtest_child(EASIEST_REGTEST_TARGET_BITS);
+
+        chain.accept_header(header).unwrap();
+        assert_eq!(chain.get_best_block().unwrap(), (1, header.block_hash()));
+    }
+
+    #[test]
+    fn header_pow_is_checked_before_the_required_bits() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let genesis = genesis_block(Network::Regtest).header;
+
+        // Wrong bits, and a proof of work that does not meet them: Core reports `high-hash`
+        // from `CheckBlockHeader` before it looks at the bits.
+        let mut header = BlockHeader {
+            version: HeaderVersion::TWO,
+            prev_blockhash: genesis.block_hash(),
+            merkle_root: genesis.merkle_root,
+            time: genesis.time + 600,
+            bits: CompactTarget::from_consensus(0x2000_ffff),
+            nonce: 0,
+        };
+        while header.validate_pow(header.target()).is_ok() {
+            header.nonce += 1;
+        }
+
+        assert!(matches!(
+            chain.accept_header(header),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::NotEnoughPow
+            ))
+        ));
     }
 
     #[test]
